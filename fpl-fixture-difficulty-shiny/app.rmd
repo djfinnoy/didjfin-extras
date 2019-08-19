@@ -1,0 +1,265 @@
+---
+title: "Visualizing Premier League fixture difficulty"
+output: html_notebook
+runtime: shiny
+---
+
+```{r dependencies, echo = F, message = F}
+library(tidyverse)
+library(jsonlite)
+library(plotly)
+library(shiny)
+library(ggthemes)
+library(RColorBrewer)
+```
+
+```{r data, echo = F}
+# Download up-to-date data from the Fantasy Premier League API
+bootstrap_static <- fromJSON(
+  "https://fantasy.premierleague.com/api/bootstrap-static/"
+)
+
+# Overview of team names, and id numbers
+teams <- bootstrap_static$teams %>% 
+  select(name, id, code, starts_with("strength"))
+
+# Create the dataset we'll be using in the shiny app
+app_data <- bootstrap_static$elements %>% 
+  group_by(team_code) %>% 
+  summarize(player_id = first(id)) %>% 
+  ungroup() %>% 
+  # Add team names
+  left_join(
+    teams %>% rename(team = name, team_code = code), by = "team_code"
+  ) %>% 
+  # Download an `element-summary` for each `player_id`
+  mutate(
+    element_summary = map(player_id, function(x) {
+      paste0(
+        "https://fantasy.premierleague.com/api/element-summary/", x, "/"
+      ) %>% 
+        fromJSON(.)
+    }),
+    # Extract the fixture overview from each `element_summary`
+    fixtures = map(element_summary, function(x) x$fixtures)
+  ) %>% 
+  # Drop columns that we don't need anymore
+  select(-team_code, -id, -player_id, -element_summary) %>% 
+  mutate(
+    # Transform the nested `fixtures` datasets
+    fixtures = map(fixtures, function(x) {
+      x %>%
+        # Get opponent's id number
+        mutate(opponent_team_id = ifelse(is_home, team_a, team_h)) %>% 
+        # Only keep the variables we need
+        select(
+          gameweek = event, opponent_team_id, is_home, difficulty, kickoff_time
+        ) %>% 
+        # Merge with the `teams` dataset for team names and strength variables
+        left_join(
+          teams %>% 
+            # Pick variables, and rename them since they're reflecting
+            # the opposition
+            select(
+              opponent_team_id = id, 
+              opponent_team = name,
+              opponent_strength = strength,
+              opponent_strength_overall_home = strength_overall_home,
+              opponent_strength_overall_away = strength_overall_away,
+              opponent_strength_attack_home = strength_attack_home,
+              opponent_strength_attack_away = strength_attack_away,
+              opponent_strength_defence_home = strength_defence_home,
+              opponent_strength_defence_away = strength_defence_away
+            ),
+          by = "opponent_team_id"
+        ) %>% 
+        select(-opponent_team_id)  # Don't need this anymore
+    })
+  ) %>% 
+  # Convert from nested to long format, leaving us with one row per team-fixture
+  unnest() %>% 
+  mutate(
+    # Use home/away variable in accordance with the fixture's location
+    team_strength_overall = ifelse(is_home, strength_overall_home, strength_overall_away),
+    team_strength_attack = ifelse(is_home, strength_attack_home, strength_attack_away),
+    team_strength_defence = ifelse(is_home, strength_defence_home, strength_defence_away),
+    opponent_strength_overall = ifelse(!is_home, opponent_strength_overall_home, opponent_strength_overall_away),
+    opponent_strength_attack = ifelse(!is_home, opponent_strength_attack_home, opponent_strength_attack_away),
+    opponent_strength_defence = ifelse(!is_home, opponent_strength_defence_home, opponent_strength_defence_away),
+    # Create strength difference variables
+    difference_strength_overall = opponent_strength_overall - team_strength_overall,
+    difference_strength_attack = opponent_strength_attack - team_strength_defence,
+    difference_strength_defence = opponent_strength_defence - team_strength_attack,
+    # Clean up the format of kickoff_time
+    kickoff_time = kickoff_time %>% 
+      str_replace("T", " ") %>% 
+      str_replace("Z", "") %>% 
+      as.POSIXct()
+  ) %>% 
+  # Impose more practical column ordering, and drop unwanted columns
+  select(
+    gameweek, team, opponent_team, is_home, kickoff_time,
+    team_strength_overall, team_strength_attack, team_strength_defence,
+    opponent_strength_overall, opponent_strength_attack, opponent_strength_defence,
+    starts_with("difference")
+  ) %>%  
+  mutate(
+    # Reverse factor levels so teams are plotted in alphabetical order
+    team = factor(team) %>% factor(., levels = rev(levels(.)))
+  )
+```
+
+
+```{r shinyapp, echo = F, warning = F}
+# Crate an interactive shiny application for data visualization
+shinyApp(
+  
+  # Define the shiny UI
+  # ----------------------------------------------------------------------------
+  ui <- fluidPage(
+    tags$h4(
+      style = "text-align:center;font-weight:bold;margin-bottom:2em",
+      "Fixture difficulty (Premier League 2019-20)"     
+    ),
+    
+    fluidRow(
+      column(
+        width = 3,
+        offset = 3,
+        selectInput(
+          inputId = "fill_variable",
+          label = "Select variable to display:",
+          choices = list(
+            "Opponent overall strength" = "opponent_strength_overall",
+            "Opponent attack strength" = "opponent_strength_attack",
+            "Opponent defence strength" = "opponent_strength_defence"
+          )
+        )  # End selectInput
+      ),  # End column
+      column(
+        width = 6,
+        radioButtons(
+          inputId = "fill_mode",
+          label = "Display options:",
+          choices = list(
+            "Show opponent strength" = "abs",
+            "Show strength difference" = "diff"
+          )
+        )  # End radioButtons
+      )  # End column
+    ),  # End fluidRow
+    fluidRow(
+      column(
+        width = 12,
+        plotlyOutput(outputId = "plot")
+      )  # End column
+    )  # End fluidRow
+  ),  # End fluidPage
+  
+  # Define the shiny server function
+  # ----------------------------------------------------------------------------
+  server <- function(input, output) {
+    
+    # Get fill variable
+    get_fill_var <- function(variable = input$fill_variable, mode = input$fill_mode) {
+      ifelse(
+        mode == "diff",
+        str_replace(variable, "opponent", "difference"),
+        variable
+      ) %>% 
+        return()
+    }
+    
+    # Get hover text contents
+    get_hover_text <- function(variable = input$fill_variable, mode = input$fill_mode) {
+
+    }
+    
+    # Apply input filters
+    gen_plot_data <- reactive({
+      app_data %>% 
+        mutate(
+          fill_variable := !!sym(get_fill_var())
+        )
+    })
+    
+    # Make the plot
+    gen_plot <- function(data = gen_plot_data()) {
+      p <- data %>% 
+        ggplot(aes(x = gameweek, y = team, fill = fill_variable)) +
+        geom_raster(
+          aes(text = paste0(
+            # Line 1
+            "<b>", team, " (GW", gameweek, ifelse(is_home, " Home", " Away"), ")</b><br>",
+            # Line 2
+            case_when(
+              str_detect(input$fill_variable, "overall") ~ "&nbsp;&nbsp;Overall strength: ",
+              str_detect(input$fill_variable, "attack") ~ "&nbsp;&nbsp;Defence strength: ",         
+              str_detect(input$fill_variable, "defence") ~ "&nbsp;&nbsp;Attack strength: "         
+            ),
+            case_when(
+              str_detect(input$fill_variable, "overall") ~ team_strength_overall,         
+              str_detect(input$fill_variable, "attack") ~ team_strength_defence,
+              str_detect(input$fill_variable, "defence") ~ team_strength_attack         
+            ),
+            "<br><br>",
+            # Line 3
+            "<b>vs. ", opponent_team, "</b><br>",
+            # Line 4
+            case_when(
+              str_detect(input$fill_variable, "overall") ~ "&nbsp;&nbsp;Overall strength: ",
+              str_detect(input$fill_variable, "attack") ~ "&nbsp;&nbsp;Attack strength: ",         
+              str_detect(input$fill_variable, "defence") ~ "&nbsp;&nbsp;Defence strength: "              
+            ),
+            case_when(
+              str_detect(input$fill_variable, "overall") ~ opponent_strength_overall,
+              str_detect(input$fill_variable, "attack") ~ opponent_strength_attack,
+              str_detect(input$fill_variable, "defence") ~ opponent_strength_defence
+            ),
+            "<br><br>",
+            # Line 5
+            "Color value: ", fill_variable, "<br><br>",
+            # Line 6 - 7
+            "Kickoff time (GMT):<br>", kickoff_time
+          ))
+        ) +
+        scale_x_continuous(
+          limits = c(0, 39),
+          breaks = c(1:38),
+          expand = c(0, 0)
+        ) +
+        scale_fill_distiller(palette = "YlOrRd", direction = 1) +
+        theme_tufte(base_family = "sans-serif") +
+        theme(legend.position = "bottom") +
+        labs(
+          x = "Gameweek",
+          y = "",
+          fill = "",
+          title = case_when(
+            input$fill_mode == "abs" & input$fill_variable %>% str_detect("overall") ~ "Opponent overall strength",
+            input$fill_mode == "abs" & input$fill_variable %>% str_detect("attack") ~ "Opponent attack strength",           
+            input$fill_mode == "abs" & input$fill_variable %>% str_detect("defence") ~ "Opponent defence strength",           
+            input$fill_mode == "diff" & input$fill_variable %>% str_detect("overall") ~ "Opponent overall strength - Team overall strength",           
+            input$fill_mode == "diff" & input$fill_variable %>% str_detect("attack") ~ "Opponent attack strength - Team defence strength",                      
+            input$fill_mode == "diff" & input$fill_variable %>% str_detect("defence") ~ "Opponent defence strength - Team attack strength"
+          ) %>% paste("Color logic:", .)
+        )
+        
+      
+      ggplotly(p, tooltip = "text") %>% 
+        # Disable unneccessary plotly functionality
+        layout(
+          legend = list(orientation = "h", x = -0.5, y = -1),
+          xaxis = list(fixedrange = T),  
+          yaxis = list(fixedrange = T)
+        ) %>% 
+        config(displayModeBar = F) 
+    }
+  
+  # Render the plot
+  output$plot <- renderPlotly(gen_plot())
+  
+  }  # End server
+)  # End shinyApp
+```
+
